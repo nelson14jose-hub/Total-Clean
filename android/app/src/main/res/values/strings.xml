@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Total Clean</string>
+    <string name="title_activity_main">Total Clean</string>
+    <string name="package_name">com.totalclean.app</string>
+    <string name="custom_url_scheme">com.totalclean.app</string>
+</resources>
