@@ -33,6 +33,68 @@ const TRABAJADORES_BASE = [
 const money = value => Number(value || 0).toLocaleString('es-CO');
 const cleanPhone = value => String(value || '').replace(/\D/g, '');
 
+const leerImagenesServicio = servicio => {
+  const valor = servicio?.imagen;
+  if (!valor) return [];
+  if (Array.isArray(valor)) return valor.filter(Boolean);
+  if (typeof valor === 'string') {
+    try {
+      const parsed = JSON.parse(valor);
+      if (Array.isArray(parsed)) return parsed.filter(Boolean);
+    } catch (_) {}
+    return [valor];
+  }
+  return [];
+};
+
+const descargarImagen = async (src, nombre='imagen') => {
+  if (!src) return;
+
+  try {
+    // Convertimos la imagen a Blob para que Android/WebView no dependa
+    // del comportamiento de descarga de data:URL.
+    const respuesta = await fetch(src);
+    if (!respuesta.ok) throw new Error(`HTTP ${respuesta.status}`);
+
+    const blob = await respuesta.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${nombre}.jpg`;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  } catch (error) {
+    console.error('TOTAL CLEAN DESCARGA IMAGEN ERROR:', error);
+
+    // Respaldo para navegadores/WebView que bloqueen la descarga directa.
+    try {
+      const ventana = window.open(src, '_blank', 'noopener,noreferrer');
+      if (!ventana) window.location.href = src;
+    } catch {
+      window.location.href = src;
+    }
+  }
+};
+
+const descargarImagenesServicio = async (servicio, imagenesServicio = leerImagenesServicio(servicio)) => {
+  if (!imagenesServicio.length) return;
+
+  // En móviles descargamos una por una y esperamos a que cada descarga
+  // termine para evitar que Android bloquee múltiples descargas simultáneas.
+  for (let index = 0; index < imagenesServicio.length; index += 1) {
+    await descargarImagen(
+      imagenesServicio[index],
+      `Total-Clean-${servicio.cliente || 'servicio'}-${index + 1}`
+    );
+    await new Promise(resolve => setTimeout(resolve, 350));
+  }
+};
+
+
 function todayString() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
@@ -156,6 +218,11 @@ function App() {
   // Las asignaciones ya no se guardan en localStorage: vienen de Supabase.
   const [asignaciones, setAsignaciones] = useState({});
   const [ajustesPago, setAjustesPago] = useState(() => JSON.parse(localStorage.getItem('tc_ajustes_pago') || '{}'));
+  // Ajustes especiales para días en que Daniel y Ángel trabajaron juntos.
+  // Se guardan por fecha y trabajador para no alterar los ajustes por servicio.
+  const [ajustesDiaCompartido, setAjustesDiaCompartido] = useState(() =>
+    JSON.parse(localStorage.getItem('tc_ajustes_dia_compartido') || '{}')
+  );
   const [gastos, setGastos] = useState(() => JSON.parse(localStorage.getItem('tc_gastos') || '[]'));
   const [anticipos, setAnticipos] = useState(() => JSON.parse(localStorage.getItem('tc_anticipos') || '[]'));
   const [gasolina, setGasolina] = useState(() => JSON.parse(localStorage.getItem('tc_gasolina') || '[]'));
@@ -164,7 +231,7 @@ function App() {
   const [busqueda, setBusqueda] = useState('');
   const [formOpen, setFormOpen] = useState(false);
   const [editId, setEditId] = useState(null);
-  const [imagen, setImagen] = useState(null);
+  const [imagenes, setImagenes] = useState([]);
   const [imagenGrande, setImagenGrande] = useState(null);
   const [mensaje, setMensaje] = useState('');
   const [mesFinanzas, setMesFinanzas] = useState(() => new Date().toISOString().slice(0,7));
@@ -179,6 +246,9 @@ function App() {
   const [publicidadManual, setPublicidadManual] = useState(() =>
     JSON.parse(localStorage.getItem('tc_publicidad_manual') || '{}')
   );
+  // InDriver de Marry: se guarda por fecha en Supabase.
+  // Estructura: { 'YYYY-MM-DD': monto }
+  const [indriverMarry, setIndriverMarry] = useState({});
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [loginEmail, setLoginEmail] = useState('');
@@ -362,8 +432,27 @@ function App() {
 
           const semanaCloud = {};
           const publicidadCloud = {};
+          const indriverCloud = {};
+          const ajustesDiaCompartidoCloud = {};
 
           cloudRows.forEach(row => {
+            if (row.tipo === 'ajuste_dia_compartido') {
+              const fechaRow = String(row.fecha_inicio || '');
+              const trabajadorRow = normalizeWorkerId(row.trabajador_id);
+              if (fechaRow && trabajadorRow) {
+                const key = claveAjusteDiaCompartido(fechaRow, trabajadorRow);
+                ajustesDiaCompartidoCloud[key] = {
+                  pago: Number(row.base || 0),
+                  moto: Number(row.publicidad || 0)
+                };
+              }
+            }
+            if (row.tipo === 'indriver_marry') {
+              const fechaRow = String(row.fecha_inicio || '');
+              if (fechaRow) {
+                indriverCloud[fechaRow] = Number(row.producto || 0);
+              }
+            }
             if (row.tipo === 'trabajador_semana') {
               semanaCloud[String(row.clave)] = {
                 producto: Number(row.producto || 0),
@@ -377,8 +466,52 @@ function App() {
             }
           });
 
+          // Migrar los ajustes diarios antiguos que solo existan en este dispositivo.
+          const localAjustesDia = JSON.parse(localStorage.getItem('tc_ajustes_dia_compartido') || '{}');
+          const migracionesAjustesDia = Object.entries(localAjustesDia)
+            .filter(([key]) => !cloudKeys.has(`ajuste_dia_compartido_${key}`))
+            .map(([key, values]) => {
+              const separador = key.lastIndexOf('_');
+              const fechaRow = separador > 0 ? key.slice(0, separador) : '';
+              const trabajadorRow = separador > 0 ? normalizeWorkerId(key.slice(separador + 1)) : null;
+              return {
+                clave: `ajuste_dia_compartido_${key}`,
+                tipo: 'ajuste_dia_compartido',
+                trabajador_id: trabajadorRow,
+                periodo_tipo: 'dia',
+                fecha_inicio: fechaRow,
+                fecha_fin: fechaRow,
+                producto: 0,
+                gasolina: 0,
+                base: Number(values?.pago || 0),
+                publicidad: Number(values?.moto || 0)
+              };
+            })
+            .filter(row => row.fecha_inicio && row.trabajador_id);
+
+          if (migracionesAjustesDia.length) {
+            const { error: migracionAjustesError } = await supabase
+              .from('finanzas_manuales')
+              .upsert(migracionesAjustesDia, { onConflict: 'clave' });
+
+            if (migracionAjustesError) {
+              console.error('TOTAL CLEAN MIGRACION AJUSTES DIA ERROR:', migracionAjustesError);
+            } else {
+              migracionesAjustesDia.forEach(row => {
+                cloudRows.push(row);
+                const key = claveAjusteDiaCompartido(row.fecha_inicio, row.trabajador_id);
+                ajustesDiaCompartidoCloud[key] = {
+                  pago: Number(row.base || 0),
+                  moto: Number(row.publicidad || 0)
+                };
+              });
+            }
+          }
+
+          setAjustesDiaCompartido(prev => ({ ...prev, ...ajustesDiaCompartidoCloud }));
           setGastosSemanaManual(prev => ({ ...prev, ...semanaCloud }));
           setPublicidadManual(prev => ({ ...prev, ...publicidadCloud }));
+          setIndriverMarry(prev => ({ ...prev, ...indriverCloud }));
         }
       } catch (error) {
         console.error('TOTAL CLEAN ERROR CARGANDO DATOS:', error);
@@ -589,12 +722,162 @@ const setAsignados = (id, ids) => {
     serviciosDeTrabajadorDia(trabajador, fechaConsulta)
       .filter(s => String(s.estado || 'pendiente').toLowerCase() === 'realizado');
 
+  const esJueves = fechaConsulta => {
+    if (!fechaConsulta) return false;
+    return new Date(`${fechaConsulta}T12:00:00`).getDay() === 4;
+  };
+
+  const esMarry = trabajador =>
+    String(trabajador?.nombre || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') === 'marry';
+
+  const indriverMarryDelDia = fechaConsulta => {
+    if (!esJueves(fechaConsulta)) return 0;
+    return Math.max(0, Number(indriverMarry[fechaConsulta] || 0));
+  };
+
+  const guardarIndriverMarry = async (fechaConsulta, valor) => {
+    const monto = Math.max(0, Math.round(Number(valor || 0)));
+
+    // Se reutiliza finanzas_manuales, que ya está integrada con Supabase.
+    // producto guarda el único monto de esta fila; tipo identifica que es InDriver.
+    const payload = {
+      clave: `indriver_marry_${fechaConsulta}`,
+      tipo: 'indriver_marry',
+      trabajador_id: normalizeWorkerId(
+        trabajadores.find(t => esMarry(t))?.id || 'd7720ee0-fcf9-4403-8836-63b4c499ba7f'
+      ),
+      periodo_tipo: 'semana',
+      fecha_inicio: fechaConsulta,
+      fecha_fin: fechaConsulta,
+      producto: monto,
+      gasolina: 0,
+      base: 0,
+      publicidad: 0
+    };
+
+    const { error } = await supabase
+      .from('finanzas_manuales')
+      .upsert(payload, { onConflict: 'clave' });
+
+    if (error) {
+      console.error('TOTAL CLEAN INDRIVER ERROR:', error);
+      alert(`No se pudo guardar el InDriver en la nube: ${error.message}`);
+      return false;
+    }
+
+    setIndriverMarry(prev => ({ ...prev, [fechaConsulta]: monto }));
+    setMensaje('☁️ InDriver guardado en la nube');
+    setTimeout(() => setMensaje(''), 1800);
+    return true;
+  };
+
+  const esDaniel = trabajador =>
+    String(trabajador?.nombre || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') === 'daniel';
+
+  const esAngel = trabajador =>
+    String(trabajador?.nombre || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') === 'angel';
+
+  // Solo cuenta si existe al menos un servicio REALIZADO donde aparecen
+  // Daniel y Ángel juntos.
+  const hicieronServicioJuntos = fechaConsulta =>
+    servicios.some(s => {
+      if (s.fecha !== fechaConsulta) return false;
+      if (String(s.estado || 'pendiente').toLowerCase() !== 'realizado') return false;
+      const ids = getAsignados(s.id);
+      return ids.includes(SUPABASE_WORKER_IDS.daniel) &&
+             ids.includes(SUPABASE_WORKER_IDS.angel);
+    });
+
+  const claveAjusteDiaCompartido = (fechaConsulta, trabajadorId) =>
+    `${fechaConsulta}_${normalizeWorkerId(trabajadorId)}`;
+
+  const ajusteDiaCompartido = (fechaConsulta, trabajadorId) =>
+    ajustesDiaCompartido[claveAjusteDiaCompartido(fechaConsulta, trabajadorId)] || null;
+
+  const editarPagoDiaCompartido = async (trabajador, fechaConsulta) => {
+    if (!esDaniel(trabajador) && !esAngel(trabajador)) return;
+    if (!hicieronServicioJuntos(fechaConsulta)) return;
+
+    const actual = ajusteDiaCompartido(fechaConsulta, trabajador.id);
+    const pagoActual = actual?.pago !== undefined
+      ? Number(actual.pago)
+      : Number(pagoTrabajadorDia(trabajador, fechaConsulta) || 0);
+    const motoActual = actual?.moto !== undefined
+      ? Number(actual.moto)
+      : 30000;
+
+    const pagoTexto = prompt(
+      `Pago FINAL de ${trabajador.nombre} para ${datePagoLabel(fechaConsulta)}:`,
+      String(pagoActual)
+    );
+    if (pagoTexto === null) return;
+
+    const pago = Math.max(0, Math.round(Number(String(pagoTexto).replace(/\D/g, '') || 0)));
+
+    const motoTexto = prompt(
+      `Moto del día para ${trabajador.nombre}:`,
+      String(motoActual)
+    );
+    if (motoTexto === null) return;
+
+    const moto = Math.max(0, Math.round(Number(String(motoTexto).replace(/\D/g, '') || 0)));
+    const key = claveAjusteDiaCompartido(fechaConsulta, trabajador.id);
+    const next = {
+      ...ajustesDiaCompartido,
+      [key]: { pago, moto }
+    };
+
+    setAjustesDiaCompartido(next);
+    persist('tc_ajustes_dia_compartido', next);
+
+    const { error } = await supabase
+      .from('finanzas_manuales')
+      .upsert({
+        clave: `ajuste_dia_compartido_${key}`,
+        tipo: 'ajuste_dia_compartido',
+        trabajador_id: normalizeWorkerId(trabajador.id),
+        periodo_tipo: 'dia',
+        fecha_inicio: fechaConsulta,
+        fecha_fin: fechaConsulta,
+        producto: 0,
+        gasolina: 0,
+        base: pago,
+        publicidad: moto
+      }, { onConflict: 'clave' });
+
+    if (error) {
+      console.error('TOTAL CLEAN AJUSTE DIA ERROR:', error);
+      alert(`El ajuste quedó guardado en este dispositivo, pero no se pudo subir a la nube: ${error.message}`);
+      return;
+    }
+
+    setMensaje(`☁️ Pago y moto de ${trabajador.nombre} guardados en la nube`);
+    setTimeout(() => setMensaje(''), 1800);
+  };
+
   const motoDelDia = (trabajador, fechaConsulta) => {
     if (!trabajador || trabajador.tipo_pago === 'propietario') return 0;
 
     const tieneServicio = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta).length > 0;
 
-    // Los tres trabajadores normales usan $30.000 como regla diaria.
+    if ((esDaniel(trabajador) || esAngel(trabajador)) && hicieronServicioJuntos(fechaConsulta)) {
+      const ajuste = ajusteDiaCompartido(fechaConsulta, trabajador.id);
+      if (ajuste?.moto !== undefined) return Math.max(0, Number(ajuste.moto || 0));
+    }
+
+    // Jueves de Marry: InDriver reemplaza completamente la moto.
+    if (esMarry(trabajador) && esJueves(fechaConsulta)) return 0;
+
+    // Los trabajadores normales usan $30.000 como regla diaria.
     // Daniel tiene $40.000 de moto total, pero $10.000 salen de su parte
     // como ajuste independiente; por eso aquí descontamos $30.000.
     return tieneServicio ? 30000 : 0;
@@ -618,7 +901,8 @@ const setAsignados = (id, ids) => {
     );
 
     const moto = motoDelDia(trabajador, fechaConsulta);
-    const netoDia = Math.max(0, totalDia - moto);
+    const indriver = esMarry(trabajador) ? indriverMarryDelDia(fechaConsulta) : 0;
+    const netoDia = Math.max(0, totalDia - moto - indriver);
 
     const porcentaje = trabajoConjunto ? 25 : 50;
 
@@ -652,6 +936,11 @@ const setAsignados = (id, ids) => {
     const serviciosT = serviciosDeTrabajadorDia(trabajador, fechaConsulta);
     if (!serviciosT.length) return 0;
 
+    if ((esDaniel(trabajador) || esAngel(trabajador)) && hicieronServicioJuntos(fechaConsulta)) {
+      const ajusteDia = ajusteDiaCompartido(fechaConsulta, trabajador.id);
+      if (ajusteDia?.pago !== undefined) return Math.max(0, Math.round(Number(ajusteDia.pago || 0)));
+    }
+
     const ajustes = serviciosT.filter(
       s => ajustesPago[`${s.id}_${trabajador.id}`] !== undefined
     );
@@ -673,6 +962,7 @@ const setAsignados = (id, ids) => {
     );
 
     const moto = motoDelDia(trabajador, fechaConsulta);
+    const indriver = esMarry(trabajador) ? indriverMarryDelDia(fechaConsulta) : 0;
 
     let pago = serviciosT.reduce((sum, s) => {
       const key = `${s.id}_${trabajador.id}`;
@@ -685,8 +975,9 @@ const setAsignados = (id, ids) => {
       return sum + Number(s.precio || 0) * (porcentaje / 100);
     }, 0);
 
-    // Moto una sola vez por día.
+    // Moto e InDriver se aplican una sola vez por día.
     pago -= moto;
+    pago -= indriver;
 
     // Daniel: $10.000 adicionales, aparte de la moto.
     if (String(trabajador.nombre).toLowerCase() === 'daniel') {
@@ -726,19 +1017,30 @@ Ajustes: $${money(ajustesSemana)}
   };
 
   const cobrosDiarios = (trabajador, fechaConsulta) => {
+    const trabajadorId = normalizeWorkerId(trabajador?.id);
+    const angelId = normalizeWorkerId(SUPABASE_WORKER_IDS.angel);
     const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
 
     return serviciosT.reduce(
       (totales, servicio) => {
         const valor = Number(servicio.precio || 0);
         const forma = String(servicio.forma_pago || 'efectivo').toLowerCase();
+        const ids = getAsignados(servicio.id).map(normalizeWorkerId);
+        const servicioCompartidoDanielAngel =
+          ids.includes(normalizeWorkerId(SUPABASE_WORKER_IDS.daniel)) &&
+          ids.includes(angelId);
 
         if (forma === 'transferencia' || forma === 'transferencia bancaria') {
+          // Las transferencias siguen perteneciendo al trabajador asignado.
           totales.transferencia += valor;
-        } else {
+        } else if (!servicioCompartidoDanielAngel || trabajadorId === angelId) {
+          // Si Daniel y Ángel hicieron el servicio juntos, SOLO Ángel recibe
+          // el efectivo de ese servicio. Los demás servicios conservan su dueño.
           totales.efectivo += valor;
         }
 
+        // La facturación/total continúa correspondiendo a los servicios
+        // asignados al trabajador; aquí solo redistribuimos el efectivo.
         totales.total += valor;
         return totales;
       },
@@ -747,35 +1049,36 @@ Ajustes: $${money(ajustesSemana)}
   };
 
   const pagoCopiable = (trabajador, fechaConsulta=fecha) => {
-  const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
+    const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
 
-  const facturacion = serviciosT.reduce(
-    (sum, s) => sum + Number(s.precio || 0),
-    0
-  );
+    const facturacion = serviciosT.reduce(
+      (sum, s) => sum + Number(s.precio || 0),
+      0
+    );
 
-  const moto = motoDelDia(trabajador, fechaConsulta);
-  const nombre = String(trabajador.nombre || '').toLowerCase();
+    const moto = motoDelDia(trabajador, fechaConsulta);
+    const nombre = String(trabajador.nombre || '').toLowerCase();
+    const esMarryJueves = esMarry(trabajador) && esJueves(fechaConsulta);
+    const indriver = esMarryJueves ? indriverMarryDelDia(fechaConsulta) : 0;
 
-  const motoMostrada =
-    nombre === 'daniel' && moto > 0
-      ? 40000
-      : (nombre === 'marry' || nombre === 'ángel' || nombre === 'angel')
-        ? 30000
-        : moto;
+    const motoMostrada =
+      nombre === 'daniel' && moto > 0
+        ? 40000
+        : (nombre === 'marry' || nombre === 'ángel' || nombre === 'angel')
+          ? 30000
+          : moto;
 
-  const pago = pagoTrabajadorDia(trabajador, fechaConsulta);
+    const pago = pagoTrabajadorDia(trabajador, fechaConsulta);
+    const cobros = cobrosDiarios(trabajador, fechaConsulta);
 
-  const cobros = cobrosDiarios(trabajador, fechaConsulta);
-
-  return `*Pago ${datePagoLabel(fechaConsulta)}*
+    return `*Pago ${datePagoLabel(fechaConsulta)}*
 
 *Facturacion:* $${money(facturacion)}
 *Efectivo:* $${money(cobros.efectivo)}
 *Transferencia:* $${money(cobros.transferencia)}
-*Moto:* $${money(motoMostrada)}
+${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMostrada)}`}
 *Pago:* $${money(pago)}`;
-};
+  };
 
   const copiar = async text => {
     try { await navigator.clipboard.writeText(text); setMensaje('📋 Copiado'); setTimeout(()=>setMensaje(''),1800); }
@@ -795,24 +1098,27 @@ Ajustes: $${money(ajustesSemana)}
   const abrirWhatsApp = servicio => {
     let tel = cleanPhone(servicio.telefono);
     if (!tel) return alert('Este servicio no tiene número telefónico.');
+    if (tel.length === 10 && tel.startsWith('3')) tel = `57${tel}`;
     if (!tel.startsWith('57')) tel = `57${tel}`;
     const text = `Hola ${servicio.cliente} 👋\n\nSomos Total Clean 🧼.\n\nLe confirmamos su servicio para el día ${dateLabel(servicio.fecha)} a las ${horaCorta(servicio.hora)}.\n\n🛋️ Servicio: ${servicio.articulo}\n💰 Valor: $${money(servicio.precio)}\n📍 Dirección: ${servicio.direccion}\n\n¡Muchas gracias! 😊`;
-    window.open(`https://web.whatsapp.com/send?phone=${tel}&text=${encodeURIComponent(text)}`,'_blank');
+    const url = `https://wa.me/${tel}?text=${encodeURIComponent(text)}`;
+    const nuevaVentana = window.open(url, '_blank');
+    if (!nuevaVentana) window.location.href = url;
   };
 
   const abrirNuevo = () => {
-    setEditId(null); setImagen(null);
+    setEditId(null); setImagenes([]);
     setFormulario({...blankForm, fecha});
     setFormOpen(true); setSeccion('agenda');
   };
 
   const editar = servicio => {
-    setEditId(servicio.id); setImagen(servicio.imagen || null);
+    setEditId(servicio.id); setImagenes(leerImagenesServicio(servicio));
     setFormulario({
       cliente:servicio.cliente||'', telefono:servicio.telefono||'', direccion:servicio.direccion||'',
       articulo:servicio.articulo||'', fecha:servicio.fecha||fecha, hora:servicio.hora||'',
       ciudad:servicio.ciudad||'Barranquilla', origen:servicio.origen||'Business',
-      precio:servicio.precio||'', observaciones:servicio.observaciones||'', imagen:servicio.imagen||'',
+      precio:servicio.precio||'', observaciones:servicio.observaciones||'', imagen:'',
       forma_pago:servicio.forma_pago||'efectivo'
     });
     setFormOpen(true);
@@ -847,7 +1153,7 @@ Ajustes: $${money(ajustesSemana)}
       cliente:formulario.cliente, telefono:formulario.telefono, direccion:formulario.direccion,
       articulo:formulario.articulo, fecha:formulario.fecha, hora:formulario.hora,
       ciudad:formulario.ciudad, origen:formulario.origen, precio:Number(formulario.precio||0),
-      observaciones:formulario.observaciones, imagen:formulario.imagen||imagen||null,
+      observaciones:formulario.observaciones, imagen:imagenes.length === 1 ? imagenes[0] : (imagenes.length > 1 ? JSON.stringify(imagenes) : null),
       estado: editId ? (servicios.find(s=>s.id===editId)?.estado || 'pendiente') : 'pendiente',
       forma_pago: formulario.forma_pago || 'efectivo'
     };
@@ -897,7 +1203,7 @@ Ajustes: $${money(ajustesSemana)}
     setFecha(payload.fecha);
     setFormOpen(false);
     setFormulario({...blankForm, fecha:payload.fecha});
-    setImagen(null);
+    setImagenes([]);
     setMensaje(editId ? '✅ Servicio actualizado' : '✅ Servicio guardado');
     setTimeout(()=>setMensaje(''),1600);
   };
@@ -958,6 +1264,14 @@ Ajustes: $${money(ajustesSemana)}
           if (!row) return;
 
           if (payload.eventType === 'DELETE') {
+            if (row.tipo === 'indriver_marry') {
+              const fechaRow = String(row.fecha_inicio || '');
+              setIndriverMarry(prev => {
+                const next = { ...prev };
+                delete next[fechaRow];
+                return next;
+              });
+            }
             if (row.tipo === 'trabajador_semana') {
               setGastosSemanaManual(prev => {
                 const next = { ...prev };
@@ -973,7 +1287,29 @@ Ajustes: $${money(ajustesSemana)}
                 return next;
               });
             }
+            if (row.tipo === 'ajuste_dia_compartido') {
+              const fechaRow = String(row.fecha_inicio || '');
+              const trabajadorRow = normalizeWorkerId(row.trabajador_id);
+              if (fechaRow && trabajadorRow) {
+                const key = claveAjusteDiaCompartido(fechaRow, trabajadorRow);
+                setAjustesDiaCompartido(prev => {
+                  const next = { ...prev };
+                  delete next[key];
+                  return next;
+                });
+              }
+            }
             return;
+          }
+
+          if (row.tipo === 'indriver_marry') {
+            const fechaRow = String(row.fecha_inicio || '');
+            if (fechaRow) {
+              setIndriverMarry(prev => ({
+                ...prev,
+                [fechaRow]: Number(row.producto || 0)
+              }));
+            }
           }
 
           if (row.tipo === 'trabajador_semana') {
@@ -994,6 +1330,21 @@ Ajustes: $${money(ajustesSemana)}
               [key]: Number(row.publicidad || 0)
             }));
           }
+
+          if (row.tipo === 'ajuste_dia_compartido') {
+            const fechaRow = String(row.fecha_inicio || '');
+            const trabajadorRow = normalizeWorkerId(row.trabajador_id);
+            if (fechaRow && trabajadorRow) {
+              const key = claveAjusteDiaCompartido(fechaRow, trabajadorRow);
+              setAjustesDiaCompartido(prev => ({
+                ...prev,
+                [key]: {
+                  pago: Number(row.base || 0),
+                  moto: Number(row.publicidad || 0)
+                }
+              }));
+            }
+          }
         }
       )
       .subscribe();
@@ -1008,11 +1359,55 @@ Ajustes: $${money(ajustesSemana)}
     setFecha(d.toISOString().slice(0,10)); setFormOpen(false);
   };
 
-  const seleccionarImagen = e => {
-    const file=e.target.files?.[0]; if(!file) return;
-    const reader=new FileReader();
-    reader.onload=()=>{setImagen(reader.result); setFormulario(f=>({...f,imagen:reader.result}));};
-    reader.readAsDataURL(file);
+  const seleccionarImagen = async e => {
+    const files = Array.from(e.target.files || []);
+    await agregarImagenes(files, e.target);
+  };
+
+  const agregarImagenes = async (filesInput, inputEl = null) => {
+    const files = Array.from(filesInput || []).filter(file => String(file.type || '').startsWith('image/'));
+    if (!files.length) return;
+
+    const disponibles = 10 - imagenes.length;
+    if (disponibles <= 0) {
+      alert('Puedes guardar máximo 10 imágenes por servicio.');
+      if (inputEl) inputEl.value = '';
+      return;
+    }
+
+    const reducirImagen = file => new Promise(resolve => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          const max = 1600;
+          const escala = Math.min(1, max / Math.max(img.width, img.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(img.width * escala));
+          canvas.height = Math.max(1, Math.round(img.height * escala));
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.78));
+        };
+        img.onerror = () => resolve(reader.result);
+        img.src = reader.result;
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    });
+
+    const nuevas = (await Promise.all(files.slice(0, disponibles).map(reducirImagen))).filter(Boolean);
+    setImagenes(prev => [...prev, ...nuevas]);
+    if (inputEl) inputEl.value = '';
+  };
+
+  const quitarImagen = index => {
+    setImagenes(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const manejarSoltarImagenes = async e => {
+    e.preventDefault();
+    await agregarImagenes(e.dataTransfer?.files || []);
   };
 
   const actualizarAsignacion = async (servicio, trabajadorId, checked) => {
@@ -1177,9 +1572,35 @@ Ajustes: $${money(ajustesSemana)}
     .filter(g=>g.fecha >= rangoFinanzas.inicio && g.fecha <= rangoFinanzas.fin)
     .reduce((a,g)=>a+Number(g.monto||0),0);
 
-  // Acumulado real de moto: $30.000 por trabajador por día trabajado.
-  // Daniel conserva su $10.000 adicional como ajuste de su parte, no como
-  // un segundo cobro de moto en Finanzas.
+  // ACUMULADO DE MOTO (ahorro):
+  // Daniel acumula $40.000 por cada día trabajado.
+  // Los $30.000 siguen siendo el gasto real del negocio y NO se cambian.
+  // Ángel y los demás conservan su valor normal.
+  const motoAcumuladaDelDia = (trabajador, fechaConsulta) => {
+    if (!trabajador || trabajador.tipo_pago === 'propietario') return 0;
+
+    const tieneServicio = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta).length > 0;
+    if (!tieneServicio) return 0;
+
+    if (esDaniel(trabajador)) {
+      const ajuste = ajusteDiaCompartido(fechaConsulta, trabajador.id);
+      if (hicieronServicioJuntos(fechaConsulta) && ajuste?.moto !== undefined) {
+        return Math.max(0, Number(ajuste.moto || 0));
+      }
+      return 40000;
+    }
+
+    const ajuste = (esAngel(trabajador) && hicieronServicioJuntos(fechaConsulta))
+      ? ajusteDiaCompartido(fechaConsulta, trabajador.id)
+      : null;
+
+    if (ajuste?.moto !== undefined) {
+      return Math.max(0, Number(ajuste.moto || 0));
+    }
+
+    return motoDelDia(trabajador, fechaConsulta);
+  };
+
   const motoTrabajadoresPeriodo = trabajadores
     .filter(t => t.tipo_pago !== 'propietario')
     .map(t => ({
@@ -1191,7 +1612,7 @@ Ajustes: $${money(ajustesSemana)}
           d <= new Date(`${rangoFinanzas.fin}T12:00:00`);
           d.setDate(d.getDate() + 1)
         ) {
-          total += motoDelDia(t, d.toISOString().slice(0,10));
+          total += motoAcumuladaDelDia(t, d.toISOString().slice(0,10));
         }
         return total;
       })()
@@ -1199,6 +1620,22 @@ Ajustes: $${money(ajustesSemana)}
 
   const motoPeriodo = motoTrabajadoresPeriodo
     .reduce((a,x)=>a+x.total,0);
+
+  // Gasto real de moto del negocio: se mantiene en $30.000 por día.
+  // Esto es independiente del acumulado/ahorro de Daniel ($40.000).
+  const motoGastoPeriodo = trabajadores
+    .filter(t => t.tipo_pago !== 'propietario')
+    .reduce((totalTrabajadores, trabajador) => {
+      let total = 0;
+      for (
+        let d = new Date(`${rangoFinanzas.inicio}T12:00:00`);
+        d <= new Date(`${rangoFinanzas.fin}T12:00:00`);
+        d.setDate(d.getDate() + 1)
+      ) {
+        total += motoDelDia(trabajador, d.toISOString().slice(0,10));
+      }
+      return totalTrabajadores + total;
+    }, 0);
 
   // Costo real de mano de obra del período.
   // Se calcula con el mismo pago diario que ya usa la sección Trabajadores,
@@ -1230,12 +1667,21 @@ Ajustes: $${money(ajustesSemana)}
   const publicidadPeriodo =
     Number(publicidadManual[periodoFinanzas+'_'+fechaFinanzas] || 0);
 
+  const indriverPeriodo = Object.entries(indriverMarry)
+    .filter(([fechaDia, monto]) =>
+      fechaDia >= rangoFinanzas.inicio &&
+      fechaDia <= rangoFinanzas.fin &&
+      esJueves(fechaDia)
+    )
+    .reduce((sum, [, monto]) => sum + Number(monto || 0), 0);
+
   const resultadoPeriodo =
     ingresosPeriodo -
     gastosPeriodo -
     pagosTrabajadoresPeriodoTotal -
     gasolinaPeriodo -
-    publicidadPeriodo;
+    publicidadPeriodo -
+    indriverPeriodo;
 
   // Distribución visual de los ingresos del período.
   // El resultado representa lo que queda después de los gastos que
@@ -1245,6 +1691,7 @@ Ajustes: $${money(ajustesSemana)}
       { nombre: 'Trabajadores', valor: Math.max(0, pagosTrabajadoresPeriodoTotal) },
       { nombre: 'Gastos extra', valor: Math.max(0, gastosPeriodo) },
       { nombre: 'Gasolina', valor: Math.max(0, gasolinaPeriodo) },
+      { nombre: 'InDriver', valor: Math.max(0, indriverPeriodo) },
       { nombre: 'Publicidad', valor: Math.max(0, publicidadPeriodo) },
       { nombre: 'Ganancia', valor: Math.max(0, resultadoPeriodo) }
     ];
@@ -1274,6 +1721,7 @@ Ajustes: $${money(ajustesSemana)}
     pagosTrabajadoresPeriodoTotal,
     gastosPeriodo,
     gasolinaPeriodo,
+    indriverPeriodo,
     publicidadPeriodo,
     resultadoPeriodo
   ]);
@@ -1298,16 +1746,26 @@ Ajustes: $${money(ajustesSemana)}
     return d.toISOString().slice(0,10);
   };
 
-  const serviciosSemanaEfectivo = (trabajadorId, inicio, fin) =>
-    servicios
-      .filter(s =>
-        s.estado === 'realizado' &&
-        s.forma_pago === 'efectivo' &&
-        s.fecha >= inicio &&
-        s.fecha <= fin &&
-        getAsignados(s.id).includes(trabajadorId)
-      )
-      .reduce((sum,s)=>sum+Number(s.precio||0),0);
+  const serviciosSemanaEfectivo = (trabajadorId, inicio, fin) => {
+    const trabajadorIdNormalizado = normalizeWorkerId(trabajadorId);
+    const angelId = normalizeWorkerId(SUPABASE_WORKER_IDS.angel);
+    const danielId = normalizeWorkerId(SUPABASE_WORKER_IDS.daniel);
+
+    return servicios
+      .filter(s => {
+        if (s.estado !== 'realizado' || s.forma_pago !== 'efectivo') return false;
+        if (s.fecha < inicio || s.fecha > fin) return false;
+
+        const ids = getAsignados(s.id).map(normalizeWorkerId);
+        const compartidoDanielAngel = ids.includes(danielId) && ids.includes(angelId);
+
+        // El efectivo de un servicio compartido Daniel + Ángel va únicamente
+        // a Ángel. El efectivo de cualquier otro servicio queda para quien lo hizo.
+        if (compartidoDanielAngel) return trabajadorIdNormalizado === angelId;
+        return ids.includes(trabajadorIdNormalizado);
+      })
+      .reduce((sum, s) => sum + Number(s.precio || 0), 0);
+  };
 
 
   const claveGastoSemana = (trabajadorId, inicio) =>
@@ -1374,9 +1832,10 @@ Ajustes: $${money(ajustesSemana)}
   };
 
   const guardarPublicidadPeriodo = async () => {
-    const key = periodoFinanzas + '_' + fechaFinanzas;
-    const valor = Number(publicidadManual[key] || 0);
     const rango = rangoFinanzas;
+    const key = periodoFinanzas + '_' + rango.inicio;
+    const keyLegacy = periodoFinanzas + '_' + fechaFinanzas;
+    const valor = Number(publicidadManual[key] ?? publicidadManual[keyLegacy] ?? 0);
 
     const { error } = await supabase
       .from('finanzas_manuales')
@@ -1687,7 +2146,16 @@ Ajustes: $${money(ajustesSemana)}
               <h3>{s.cliente}</h3>
               <p>📞 {s.telefono}</p><p>📍 {s.direccion}</p><p>🛋️ {s.articulo}</p><p>💰 <strong>${money(s.precio)}</strong></p>
               <p>💳 {s.forma_pago==='transferencia'?'Transferencia':'Efectivo'} {s.forma_pago==='efectivo'&&<span className="tc-badge">Efectivo pendiente</span>}</p>
-              {s.imagen && <img className="tc-thumb" src={s.imagen} alt="Artículo" onClick={()=>setImagenGrande(s.imagen)}/>}
+              {leerImagenesServicio(s).length > 0 && (
+                <div className="tc-service-images">
+                  <div className="tc-service-images-grid">
+                    {leerImagenesServicio(s).map((src, index) => (
+                      <img key={`${s.id}-img-${index}`} className="tc-thumb" src={src} alt={`Artículo ${index + 1}`} onClick={()=>setImagenGrande(src)}/>
+                    ))}
+                  </div>
+                  <button type="button" className="tc-download-images" onClick={()=>descargarImagenesServicio(s)}>⬇️ Descargar imágenes</button>
+                </div>
+              )}
               {s.observaciones && <p>📝 {s.observaciones}</p>}
 
               <div className="tc-workers">
@@ -1776,6 +2244,10 @@ Ajustes: $${money(ajustesSemana)}
                 const serviciosDia=serviciosDeTrabajadorDia(t,fechaTrabajadores);
                 const total=pagoTrabajadorDia(t,fechaTrabajadores);
                 const moto=motoDelDia(t,fechaTrabajadores);
+                const ajusteCompartido=ajusteDiaCompartido(fechaTrabajadores,t.id);
+                const motoMostrada=(esDaniel(t) || esAngel(t)) && hicieronServicioJuntos(fechaTrabajadores) && ajusteCompartido?.moto !== undefined
+                  ? Number(ajusteCompartido.moto)
+                  : moto;
                 const generado=serviciosDia.reduce((sum,s)=>sum+Number(s.precio||0),0);
 
                 if (!serviciosDia.length) return null;
@@ -1784,9 +2256,18 @@ Ajustes: $${money(ajustesSemana)}
                   <div>
                     <h3>{t.nombre}</h3>
                     <p>Servicios del día: ${money(generado)}</p>
-                    {moto>0 && <small>Moto del día: -${money(moto)}</small>}
+                    {motoMostrada>0 && <small>Moto del día: -${money(motoMostrada)}</small>}
                     {String(t.nombre).toLowerCase()==='daniel' && (
                       <small>Ajuste Daniel: -$10.000</small>
+                    )}
+                    {(esDaniel(t) || esAngel(t)) && hicieronServicioJuntos(fechaTrabajadores) && (
+                      <button
+                        type="button"
+                        className="tc-shared-adjust"
+                        onClick={()=>editarPagoDiaCompartido(t,fechaTrabajadores)}
+                      >
+                        ✏️ Ajustar pago y moto
+                      </button>
                     )}
                   </div>
 
@@ -1802,6 +2283,51 @@ Ajustes: $${money(ajustesSemana)}
                       </div>
                     );
                   })()}
+
+                  {esMarry(t) && esJueves(fechaTrabajadores) && (
+                    <div className="tc-indriver-box" style={{gridColumn: '1 / -1', minWidth: 0}}>
+                      <div className="tc-indriver-head">
+                        <div>
+                          <strong>🚗 InDriver de Marry</strong>
+                          <small>Este jueves reemplaza la moto y se descuenta antes del 50/50.</small>
+                        </div>
+                        <span>☁️ Nube</span>
+                      </div>
+
+                      <div className="tc-indriver-row">
+                        <input
+                          className="tc-indriver-input"
+                          type="number"
+                          min="0"
+                          step="1000"
+                          value={indriverMarry[fechaTrabajadores] ?? ''}
+                          onChange={e => {
+                            const valor = e.target.value;
+                            setIndriverMarry(prev => ({
+                              ...prev,
+                              [fechaTrabajadores]: valor === '' ? '' : Number(valor)
+                            }));
+                          }}
+                          placeholder="$ 0"
+                        />
+                        <button
+                          className="tc-indriver-save"
+                          onClick={() => guardarIndriverMarry(
+                            fechaTrabajadores,
+                            indriverMarry[fechaTrabajadores] || 0
+                          )}
+                        >
+                          💾 Guardar
+                        </button>
+                      </div>
+
+                      <small className="tc-indriver-status">
+                        {indriverMarry[fechaTrabajadores]
+                          ? `Guardado/registrado: $${money(indriverMarry[fechaTrabajadores])}`
+                          : 'Ingresa el valor del InDriver de este jueves.'}
+                      </small>
+                    </div>
+                  )}
 
                   <button onClick={()=>copiar(pagoCopiable(t,fechaTrabajadores))}>
                     📋 Copiar pago
@@ -2116,11 +2642,11 @@ const descuentoProductoTrabajador =
                 <input
                   type="number"
                   min="0"
-                  value={publicidadManual[periodoFinanzas+'_'+fechaFinanzas] || ''}
+                  value={publicidadManual[periodoFinanzas+'_'+rangoFinanzas.inicio] ?? publicidadManual[periodoFinanzas+'_'+fechaFinanzas] ?? ''}
                   placeholder="0"
                   onChange={e=>setPublicidadManual(prev=>({
                     ...prev,
-                    [periodoFinanzas+'_'+fechaFinanzas]: Number(e.target.value||0)
+                    [periodoFinanzas+'_'+rangoFinanzas.inicio]: Number(e.target.value||0)
                   }))}
                 />
                 <button
@@ -2141,7 +2667,7 @@ const descuentoProductoTrabajador =
               <div><span>Ingresos</span><strong>${money(ingresosPeriodo)}</strong></div>
               <div><span>Gastos extra</span><strong>-${money(gastosPeriodo)}</strong></div>
               <div><span>Pagos trabajadores</span><strong>-${money(pagosTrabajadoresPeriodoTotal)}</strong></div>
-              <div><span>Moto del período</span><strong>-${money(motoPeriodo)}</strong></div>
+              <div><span>Moto del período</span><strong>-${money(motoGastoPeriodo)}</strong></div>
               <div><span>Gasolina negocio</span><strong>-${money(gasolinaPeriodo)}</strong></div>
               <div><span>Publicidad</span><strong>-${money(publicidadPeriodo)}</strong></div>
               <div className="total"><span>Resultado</span><strong>${money(resultadoPeriodo)}</strong></div>
@@ -2285,8 +2811,45 @@ const descuentoProductoTrabajador =
           <select value={formulario.origen} onChange={e=>setFormulario({...formulario,origen:e.target.value})}>{ORIGENES.map(o=><option value={o.nombre} key={o.nombre}>{o.icono} {o.nombre}</option>)}</select>
           <input inputMode="numeric" value={money(formulario.precio)} onChange={e=>setFormulario({...formulario,precio:e.target.value.replace(/\D/g,'')})} placeholder="Precio" required/>
           <textarea value={formulario.observaciones} onChange={e=>setFormulario({...formulario,observaciones:e.target.value})} placeholder="Observaciones"/>
-          <input type="file" accept="image/*" onChange={seleccionarImagen}/>
-          {imagen && <img className="tc-preview" src={imagen} alt="Vista previa"/>}
+          <label
+            className="tc-image-picker"
+            htmlFor="tc-image-input"
+            onDragOver={e=>e.preventDefault()}
+            onDrop={manejarSoltarImagenes}
+          >
+            <span className="tc-image-picker-icon">📸</span>
+            <span className="tc-image-picker-text">
+              <strong>{imagenes.length ? 'Añadir más imágenes' : 'Añadir imágenes'}</strong>
+              <small>Selecciona varias a la vez o vuelve a abrir para agregar más · máximo 10</small>
+            </span>
+          </label>
+          <input
+            id="tc-image-input"
+            className="tc-image-input"
+            type="file"
+            accept="image/jpeg,image/png,image/webp,image/heic,image/heif,image/*"
+            multiple
+            onChange={seleccionarImagen}
+          />
+          {imagenes.length > 0 && (
+            <div className="tc-upload-preview">
+              <div className="tc-upload-preview-grid">
+                {imagenes.map((src, index) => (
+                  <div className="tc-upload-preview-item" key={`preview-${index}`}>
+                    <img className="tc-preview" src={src} alt={`Vista previa ${index + 1}`}/>
+                    <button type="button" className="tc-remove-image" onClick={()=>quitarImagen(index)} aria-label={`Eliminar imagen ${index + 1}`}>✕</button>
+                  </div>
+                ))}
+              </div>
+              <div className="tc-image-download-actions">
+                <button
+                  type="button"
+                  className="tc-download-images"
+                  onClick={()=>descargarImagenesServicio({cliente:formulario.cliente}, imagenes)}
+                >⬇️ Descargar imágenes</button>
+              </div>
+            </div>
+          )}
           <div className="tc-actions"><button type="submit">💾 Guardar</button><button type="button" onClick={()=>setFormOpen(false)}>Cancelar</button></div>
         </form>
       </div></div>}
