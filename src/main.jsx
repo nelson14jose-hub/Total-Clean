@@ -586,6 +586,165 @@ function App() {
   }, []);
 
 
+  // =========================================================
+  // SINCRONIZACIÓN EN TIEMPO REAL (PRUEBA EGRESS-SAFE)
+  //
+  // No vuelve a descargar los 65 servicios. Cada cambio recibido
+  // actualiza únicamente el registro afectado en memoria.
+  // Las imágenes siguen manejándose por separado con el caché lazy.
+  // =========================================================
+  useEffect(() => {
+    if (!session) return;
+
+    const aplicarServicio = payload => {
+      const tipo = payload?.eventType;
+      const row = payload?.new || payload?.old;
+      if (!row?.id) return;
+
+      const id = String(row.id);
+
+      if (tipo === 'DELETE') {
+        setServicios(prev => prev.filter(s => String(s.id) !== id));
+        setImagenesServicios(prev => {
+          if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+        return;
+      }
+
+      setServicios(prev => {
+        const existente = prev.find(s => String(s.id) === id);
+
+        // Realtime puede traer la columna imagen. No la reemplazamos
+        // en el estado principal para evitar que una edición de texto
+        // destruya el caché visual que ya tenemos cargado.
+        const limpio = { ...row };
+        delete limpio.imagen;
+
+        if (!existente) return [...prev, limpio];
+        return prev.map(s => String(s.id) === id ? { ...s, ...limpio } : s);
+      });
+
+      // Si Realtime trae una imagen nueva, la guardamos en el caché.
+      if (Object.prototype.hasOwnProperty.call(row, 'imagen') && row.imagen) {
+        setImagenesServicios(prev => ({ ...prev, [id]: row.imagen }));
+      }
+    };
+
+    const aplicarAsignacion = payload => {
+      const tipo = payload?.eventType;
+      const row = payload?.new || payload?.old;
+      if (!row?.servicio_id) return;
+
+      const sid = String(row.servicio_id);
+
+      if (tipo === 'DELETE') {
+        const trabajadorId = normalizeWorkerId(row.trabajador_id);
+        setAsignaciones(prev => {
+          const actuales = prev[sid] || [];
+          const nextIds = actuales.filter(id => String(id) !== String(trabajadorId));
+          const next = { ...prev };
+          if (nextIds.length) next[sid] = nextIds;
+          else delete next[sid];
+          return next;
+        });
+        setAjustesPago(prev => {
+          const next = { ...prev };
+          delete next[`${sid}_${row.trabajador_id}`];
+          return next;
+        });
+        return;
+      }
+
+      const trabajadorId = normalizeWorkerId(row.trabajador_id);
+      setAsignaciones(prev => {
+        const actuales = prev[sid] || [];
+        if (actuales.some(id => String(id) === String(trabajadorId))) return prev;
+        return { ...prev, [sid]: [...actuales, trabajadorId] };
+      });
+
+      const key = `${sid}_${row.trabajador_id}`;
+      if (row.pago_manual !== null && row.pago_manual !== undefined) {
+        setAjustesPago(prev => ({ ...prev, [key]: Number(row.pago_manual) }));
+      }
+    };
+
+    const aplicarFinanza = payload => {
+      const row = payload?.new || payload?.old;
+      if (!row) return;
+
+      if (payload.eventType === 'DELETE') {
+        if (row.tipo === 'indriver_marry') {
+          setIndriverMarry(prev => {
+            const next = { ...prev };
+            delete next[String(row.fecha_inicio || '')];
+            return next;
+          });
+        }
+        if (row.tipo === 'trabajador_semana') {
+          setGastosSemanaManual(prev => {
+            const next = { ...prev };
+            delete next[String(row.clave)];
+            return next;
+          });
+        }
+        if (row.tipo === 'publicidad_periodo') {
+          const key = `${row.periodo_tipo}_${row.fecha_inicio}`;
+          setPublicidadManual(prev => {
+            const next = { ...prev };
+            delete next[key];
+            return next;
+          });
+        }
+        return;
+      }
+
+      if (row.tipo === 'indriver_marry' && row.fecha_inicio) {
+        setIndriverMarry(prev => ({
+          ...prev,
+          [String(row.fecha_inicio)]: Number(row.producto || 0)
+        }));
+      }
+
+      if (row.tipo === 'trabajador_semana') {
+        setGastosSemanaManual(prev => ({
+          ...prev,
+          [String(row.clave)]: {
+            producto: Number(row.producto || 0),
+            gasolina: Number(row.gasolina || 0),
+            base: Number(row.base || 0)
+          }
+        }));
+      }
+
+      if (row.tipo === 'publicidad_periodo') {
+        const key = `${row.periodo_tipo}_${row.fecha_inicio}`;
+        setPublicidadManual(prev => ({
+          ...prev,
+          [key]: Number(row.publicidad || 0)
+        }));
+      }
+    };
+
+    const channel = supabase
+      .channel('total-clean-sync-v2')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'servicios' }, aplicarServicio)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'servicio_trabajadores' }, aplicarAsignacion)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'finanzas_manuales' }, aplicarFinanza)
+      .subscribe(status => {
+        if (status === 'CHANNEL_ERROR') {
+          console.warn('TOTAL CLEAN REALTIME: no se pudo conectar.');
+        }
+      });
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [session]);
+
+
   // Las imágenes son el mayor bloque de datos de servicios. Se descargan
   // únicamente para los servicios del día/ciudad que el usuario está viendo.
   // Se guardan en memoria para no volver a pedirlas al cambiar de pantalla.
