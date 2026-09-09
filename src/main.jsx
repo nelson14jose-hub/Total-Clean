@@ -185,8 +185,7 @@ function Icon({ name, size = 24, stroke = 2.1 }) {
     search: <><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></>,
     filter: <path d="M4 5h16l-6 7v6l-4 2v-8L4 5Z"/>,
     more: <><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,
-    wallet: <><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v16H6.5A2.5 2.5 0 0 1 4 17.5Z"/><path d="M4 7h15"/><path d="M15 13h5v4h-5a2 2 0 0 1 0-4Z"/></>,
-    refresh: <><path d="M20 8.5A8.5 8.5 0 0 0 5.2 5.8L3.5 8"/><path d="M3.5 4.5V8h3.5"/><path d="M4 15.5a8.5 8.5 0 0 0 14.8 2.7l1.7-2.2"/><path d="M20.5 19.5V16H17"/></>
+    wallet: <><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v16H6.5A2.5 2.5 0 0 1 4 17.5Z"/><path d="M4 7h15"/><path d="M15 13h5v4h-5a2 2 0 0 1 0-4Z"/></>
   };
 
   return <svg {...common}>{paths[name] || paths.more}</svg>;
@@ -233,6 +232,7 @@ function App() {
   const [formOpen, setFormOpen] = useState(false);
   const [editId, setEditId] = useState(null);
   const [imagenes, setImagenes] = useState([]);
+  const [imagenesServicios, setImagenesServicios] = useState({});
   const [imagenGrande, setImagenGrande] = useState(null);
   const [mensaje, setMensaje] = useState('');
   const [mesFinanzas, setMesFinanzas] = useState(() => new Date().toISOString().slice(0,7));
@@ -269,33 +269,38 @@ function App() {
   useEffect(() => {
     let mounted = true;
 
-    const cargarDatos = async () => {
-      try {
-        // Comprobar nuevamente la sesión justo antes de consultar las tablas.
-        // Así evitamos hacer consultas con el rol anon durante la restauración.
-        const { data: authData, error: authError } = await supabase.auth.getSession();
+    // Evita cargas duplicadas durante el arranque.
+    // Supabase puede emitir INITIAL_SESSION y getSession() puede devolver
+    // la misma sesión. Solo permitimos una carga por usuario mientras
+    // la aplicación permanezca montada.
+    let usuarioDatosCargados = null;
+    let usuarioCargando = null;
 
-        if (authError) {
-          console.error('TOTAL CLEAN AUTH ERROR:', authError);
-          if (mounted) setLoginError('No se pudo comprobar la sesión.');
-          return;
-        }
+    const cargarDatos = async (currentSession) => {
+      const usuarioId = currentSession?.user?.id || null;
 
-        const currentSession = authData?.session || null;
-
-        if (!mounted) return;
-
-        if (!currentSession) {
+      if (!currentSession || !usuarioId) {
+        if (mounted) {
           setSession(null);
           setAuthLoading(false);
-          return;
         }
+        return;
+      }
+
+      if (usuarioDatosCargados === usuarioId || usuarioCargando === usuarioId) {
+        return;
+      }
+
+      usuarioCargando = usuarioId;
+
+      try {
+        if (!mounted) return;
 
         setSession(currentSession);
 
         const serviciosResult = await supabase
           .from('servicios')
-          .select('*')
+          .select('id,cliente,telefono,direccion,articulo,fecha,hora,ciudad,origen,precio,observaciones,estado,forma_pago')
           .order('fecha', { ascending:true })
           .order('hora', { ascending:true });
 
@@ -514,12 +519,14 @@ function App() {
           setPublicidadManual(prev => ({ ...prev, ...publicidadCloud }));
           setIndriverMarry(prev => ({ ...prev, ...indriverCloud }));
         }
+        usuarioDatosCargados = usuarioId;
       } catch (error) {
         console.error('TOTAL CLEAN ERROR CARGANDO DATOS:', error);
         if (mounted) {
           alert(`Error cargando los datos: ${error.message || error}`);
         }
       } finally {
+        if (usuarioCargando === usuarioId) usuarioCargando = null;
         if (mounted) setAuthLoading(false);
       }
     };
@@ -541,7 +548,7 @@ function App() {
         setSession(currentSession || null);
 
         if (currentSession) {
-          await cargarDatos();
+          await cargarDatos(currentSession);
         } else {
           setAuthLoading(false);
         }
@@ -561,9 +568,10 @@ function App() {
         setSession(newSession || null);
 
         if (newSession) {
-          // La sesión ya está disponible; cargar los datos con ella.
-          await cargarDatos();
+          await cargarDatos(newSession);
         } else {
+          usuarioDatosCargados = null;
+          usuarioCargando = null;
           setAuthLoading(false);
         }
       }
@@ -576,6 +584,51 @@ function App() {
       authListener?.subscription?.unsubscribe();
     };
   }, []);
+
+
+  // Las imágenes son el mayor bloque de datos de servicios. Se descargan
+  // únicamente para los servicios del día/ciudad que el usuario está viendo.
+  // Se guardan en memoria para no volver a pedirlas al cambiar de pantalla.
+  useEffect(() => {
+    let cancelled = false;
+
+    const cargarImagenesVisibles = async () => {
+      const visibles = servicios.filter(s =>
+        s.fecha === fecha && (ciudad === 'Todas' || s.ciudad === ciudad)
+      );
+      const pendientes = visibles
+        .map(s => s.id)
+        .filter(id => id && !Object.prototype.hasOwnProperty.call(imagenesServicios, String(id)));
+
+      if (!pendientes.length) return;
+
+      const { data, error } = await supabase
+        .from('servicios')
+        .select('id,imagen')
+        .in('id', pendientes);
+
+      if (cancelled) return;
+      if (error) {
+        console.error('TOTAL CLEAN IMAGENES ERROR:', error);
+        return;
+      }
+
+      const nuevas = {};
+      (data || []).forEach(row => {
+        nuevas[String(row.id)] = row.imagen || null;
+      });
+      pendientes.forEach(id => {
+        if (!Object.prototype.hasOwnProperty.call(nuevas, String(id))) nuevas[String(id)] = null;
+      });
+
+      if (!cancelled && Object.keys(nuevas).length) {
+        setImagenesServicios(prev => ({ ...prev, ...nuevas }));
+      }
+    };
+
+    cargarImagenesVisibles();
+    return () => { cancelled = true; };
+  }, [servicios, fecha, ciudad, imagenesServicios]);
 
   const serviciosDia = useMemo(() => {
     const convertirHora = valor => {
@@ -1172,6 +1225,7 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
 
       servicioGuardado = data;
       setServicios(prev=>prev.map(s=>s.id===editId?data:s));
+      setImagenesServicios(prev => ({ ...prev, [String(editId)]: data?.imagen || null }));
     } else {
       const {data,error} = await supabase
         .from('servicios')
@@ -1183,6 +1237,7 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
 
       servicioGuardado = data;
       setServicios(prev=>[...prev,data]);
+      setImagenesServicios(prev => ({ ...prev, [String(data.id)]: data?.imagen || null }));
     }
 
     setFecha(payload.fecha);
@@ -1212,12 +1267,7 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
   // en el estado local después de guardarse en Supabase.
   // Para traer cambios realizados desde otro dispositivo se usa el botón
   // "Actualizar datos" del encabezado.
-
-  const refrescarDatos = () => {
-    window.location.reload();
-  };
-
-  const cambiarDia = n => {
+const cambiarDia = n => {
     const d = new Date(`${fecha}T12:00:00`); d.setDate(d.getDate()+n);
     setFecha(d.toISOString().slice(0,10)); setFormOpen(false);
   };
@@ -1849,15 +1899,6 @@ Ajustes: $${money(ajustesSemana)}
           </div>
         </div>
         <div style={{display:'flex',alignItems:'center',gap:8}}>
-          <button
-            className="tc-icon-button"
-            type="button"
-            aria-label="Actualizar datos"
-            title="Actualizar datos desde la nube"
-            onClick={refrescarDatos}
-          >
-            <Icon name="refresh" size={25} stroke={2.8}/>
-          </button>
           <button className="tc-icon-button" aria-label="Notificaciones">
             <Icon name="bell" size={23}/>
             {resumenDia.pendientes > 0 && <b>{Math.min(resumenDia.pendientes,9)}</b>}
@@ -2014,20 +2055,23 @@ Ajustes: $${money(ajustesSemana)}
           {serviciosDia.length===0 && <section className="tc-card"><h3>📅 No tienes servicios</h3><p>No hay servicios para este día.</p></section>}
 
           {serviciosDia.map(s=>{
+            const servicioConImagen = Object.prototype.hasOwnProperty.call(imagenesServicios, String(s.id))
+              ? { ...s, imagen: imagenesServicios[String(s.id)] }
+              : s;
             const asignados=getAsignados(s.id);
             return <section className={`tc-service ${s.estado==='realizado'?'done':''}`} key={s.id}>
               <div className="tc-service-top"><strong>⏰ {horaCorta(s.hora)}</strong><span>{CIUDADES[s.ciudad]?.icono} {s.ciudad}</span><span>{s.estado==='realizado'?'🟢 REALIZADO':'🟡 PENDIENTE'}</span></div>
               <h3>{s.cliente}</h3>
               <p>📞 {s.telefono}</p><p>📍 {s.direccion}</p><p>🛋️ {s.articulo}</p><p>💰 <strong>${money(s.precio)}</strong></p>
               <p>💳 {s.forma_pago==='transferencia'?'Transferencia':'Efectivo'} {s.forma_pago==='efectivo'&&<span className="tc-badge">Efectivo pendiente</span>}</p>
-              {leerImagenesServicio(s).length > 0 && (
+              {leerImagenesServicio(servicioConImagen).length > 0 && (
                 <div className="tc-service-images">
                   <div className="tc-service-images-grid">
-                    {leerImagenesServicio(s).map((src, index) => (
+                    {leerImagenesServicio(servicioConImagen).map((src, index) => (
                       <img key={`${s.id}-img-${index}`} className="tc-thumb" src={src} alt={`Artículo ${index + 1}`} onClick={()=>setImagenGrande(src)}/>
                     ))}
                   </div>
-                  <button type="button" className="tc-download-images" onClick={()=>descargarImagenesServicio(s)}>⬇️ Descargar imágenes</button>
+                  <button type="button" className="tc-download-images" onClick={()=>descargarImagenesServicio(servicioConImagen)}>⬇️ Descargar imágenes</button>
                 </div>
               )}
               {s.observaciones && <p>📝 {s.observaciones}</p>}
@@ -2043,7 +2087,7 @@ Ajustes: $${money(ajustesSemana)}
               <div className="tc-actions">
                 <button onClick={()=>copiarServicio(s)}>📋 Copiar</button>
                 <button onClick={()=>abrirWhatsApp(s)}>💬 WhatsApp</button>
-                <button onClick={()=>editar(s)}>✏️ Editar</button>
+                <button onClick={()=>editar(servicioConImagen)}>✏️ Editar</button>
                 <button onClick={()=>cambiarEstado(s)}>{s.estado==='realizado'?'↩️ Pendiente':'✅ Servicio realizado'}</button>
                 <button className="danger" onClick={()=>eliminar(s.id)}>🗑️</button>
               </div>
