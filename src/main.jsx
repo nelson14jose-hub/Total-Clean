@@ -185,7 +185,8 @@ function Icon({ name, size = 24, stroke = 2.1 }) {
     search: <><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></>,
     filter: <path d="M4 5h16l-6 7v6l-4 2v-8L4 5Z"/>,
     more: <><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></>,
-    wallet: <><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v16H6.5A2.5 2.5 0 0 1 4 17.5Z"/><path d="M4 7h15"/><path d="M15 13h5v4h-5a2 2 0 0 1 0-4Z"/></>
+    wallet: <><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4H19v16H6.5A2.5 2.5 0 0 1 4 17.5Z"/><path d="M4 7h15"/><path d="M15 13h5v4h-5a2 2 0 0 1 0-4Z"/></>,
+    refresh: <><path d="M20 8.5A8.5 8.5 0 0 0 5.2 5.8L3.5 8"/><path d="M3.5 4.5V8h3.5"/><path d="M4 15.5a8.5 8.5 0 0 0 14.8 2.7l1.7-2.2"/><path d="M20.5 19.5V16H17"/></>
   };
 
   return <svg {...common}>{paths[name] || paths.more}</svg>;
@@ -1184,22 +1185,6 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
       setServicios(prev=>[...prev,data]);
     }
 
-    // Revalidar inmediatamente contra Supabase. Así la Agenda no depende
-    // de cerrar/reabrir la app para mostrar el servicio recién guardado.
-    try {
-      const { data: serviciosActualizados, error: refreshError } = await supabase
-        .from('servicios')
-        .select('*')
-        .order('fecha', { ascending:true })
-        .order('hora', { ascending:true });
-
-      if (!refreshError && serviciosActualizados) {
-        setServicios(serviciosActualizados);
-      }
-    } catch (refreshError) {
-      console.warn('No se pudo refrescar servicios después de guardar:', refreshError);
-    }
-
     setFecha(payload.fecha);
     setFormOpen(false);
     setFormulario({...blankForm, fecha:payload.fecha});
@@ -1222,137 +1207,15 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
     setServicios(prev=>prev.map(s=>s.id===servicio.id?{...s,estado:nuevo}:s));
   };
 
-  // Sincroniza los cambios de servicios entre PC y teléfonos.
-  useEffect(() => {
-    if (!session) return;
+  // La sincronización automática en tiempo real se desactiva para reducir Egress.
+  // Los cambios realizados desde esta aplicación se reflejan inmediatamente
+  // en el estado local después de guardarse en Supabase.
+  // Para traer cambios realizados desde otro dispositivo se usa el botón
+  // "Actualizar datos" del encabezado.
 
-    const channel = supabase
-      .channel('total-clean-servicios')
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'servicios' },
-        payload => {
-          if (payload.eventType === 'INSERT') {
-            setServicios(prev => {
-              if (prev.some(s => String(s.id) === String(payload.new.id))) return prev;
-              return [...prev, payload.new];
-            });
-            return;
-          }
-
-          if (payload.eventType === 'UPDATE') {
-            setServicios(prev =>
-              prev.map(s =>
-                String(s.id) === String(payload.new.id) ? payload.new : s
-              )
-            );
-            return;
-          }
-
-          if (payload.eventType === 'DELETE') {
-            setServicios(prev =>
-              prev.filter(s => String(s.id) !== String(payload.old.id))
-            );
-          }
-        }
-      )
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'finanzas_manuales' },
-        payload => {
-          const row = payload.new || payload.old;
-          if (!row) return;
-
-          if (payload.eventType === 'DELETE') {
-            if (row.tipo === 'indriver_marry') {
-              const fechaRow = String(row.fecha_inicio || '');
-              setIndriverMarry(prev => {
-                const next = { ...prev };
-                delete next[fechaRow];
-                return next;
-              });
-            }
-            if (row.tipo === 'trabajador_semana') {
-              setGastosSemanaManual(prev => {
-                const next = { ...prev };
-                delete next[String(row.clave)];
-                return next;
-              });
-            }
-            if (row.tipo === 'publicidad_periodo') {
-              const key = `${row.periodo_tipo}_${row.fecha_inicio}`;
-              setPublicidadManual(prev => {
-                const next = { ...prev };
-                delete next[key];
-                return next;
-              });
-            }
-            if (row.tipo === 'ajuste_dia_compartido') {
-              const fechaRow = String(row.fecha_inicio || '');
-              const trabajadorRow = normalizeWorkerId(row.trabajador_id);
-              if (fechaRow && trabajadorRow) {
-                const key = claveAjusteDiaCompartido(fechaRow, trabajadorRow);
-                setAjustesDiaCompartido(prev => {
-                  const next = { ...prev };
-                  delete next[key];
-                  return next;
-                });
-              }
-            }
-            return;
-          }
-
-          if (row.tipo === 'indriver_marry') {
-            const fechaRow = String(row.fecha_inicio || '');
-            if (fechaRow) {
-              setIndriverMarry(prev => ({
-                ...prev,
-                [fechaRow]: Number(row.producto || 0)
-              }));
-            }
-          }
-
-          if (row.tipo === 'trabajador_semana') {
-            setGastosSemanaManual(prev => ({
-              ...prev,
-              [String(row.clave)]: {
-                producto: Number(row.producto || 0),
-                gasolina: Number(row.gasolina || 0),
-                base: Number(row.base || 0)
-              }
-            }));
-          }
-
-          if (row.tipo === 'publicidad_periodo') {
-            const key = `${row.periodo_tipo}_${row.fecha_inicio}`;
-            setPublicidadManual(prev => ({
-              ...prev,
-              [key]: Number(row.publicidad || 0)
-            }));
-          }
-
-          if (row.tipo === 'ajuste_dia_compartido') {
-            const fechaRow = String(row.fecha_inicio || '');
-            const trabajadorRow = normalizeWorkerId(row.trabajador_id);
-            if (fechaRow && trabajadorRow) {
-              const key = claveAjusteDiaCompartido(fechaRow, trabajadorRow);
-              setAjustesDiaCompartido(prev => ({
-                ...prev,
-                [key]: {
-                  pago: Number(row.base || 0),
-                  moto: Number(row.publicidad || 0)
-                }
-              }));
-            }
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [session]);
+  const refrescarDatos = () => {
+    window.location.reload();
+  };
 
   const cambiarDia = n => {
     const d = new Date(`${fecha}T12:00:00`); d.setDate(d.getDate()+n);
@@ -1985,10 +1848,21 @@ Ajustes: $${money(ajustesSemana)}
             <img src="/logo-total-clean.png" alt="Total Clean"/>
           </div>
         </div>
-        <button className="tc-icon-button" aria-label="Notificaciones">
-          <Icon name="bell" size={23}/>
-          {resumenDia.pendientes > 0 && <b>{Math.min(resumenDia.pendientes,9)}</b>}
-        </button>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <button
+            className="tc-icon-button"
+            type="button"
+            aria-label="Actualizar datos"
+            title="Actualizar datos desde la nube"
+            onClick={refrescarDatos}
+          >
+            <Icon name="refresh" size={25} stroke={2.8}/>
+          </button>
+          <button className="tc-icon-button" aria-label="Notificaciones">
+            <Icon name="bell" size={23}/>
+            {resumenDia.pendientes > 0 && <b>{Math.min(resumenDia.pendientes,9)}</b>}
+          </button>
+        </div>
       </header>
 
       {mensaje && <div className="tc-toast">{mensaje}</div>}
