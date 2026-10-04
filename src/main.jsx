@@ -223,6 +223,11 @@ function App() {
   const [ajustesDiaCompartido, setAjustesDiaCompartido] = useState(() =>
     JSON.parse(localStorage.getItem('tc_ajustes_dia_compartido') || '{}')
   );
+  // Ajustes manuales por trabajador y fecha. No reemplazan las reglas automáticas:
+  // solo se usan cuando el usuario decide editar ese día.
+  const [ajustesPagoDia, setAjustesPagoDia] = useState(() =>
+    JSON.parse(localStorage.getItem('tc_ajustes_pago_dia') || '{}')
+  );
   const [gastos, setGastos] = useState(() => JSON.parse(localStorage.getItem('tc_gastos') || '[]'));
   const [anticipos, setAnticipos] = useState(() => JSON.parse(localStorage.getItem('tc_anticipos') || '[]'));
   const [gasolina, setGasolina] = useState(() => JSON.parse(localStorage.getItem('tc_gasolina') || '[]'));
@@ -255,12 +260,14 @@ function App() {
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState('');
+  const [clienteSeleccionado, setClienteSeleccionado] = useState(null);
+  const [servicioAgendaSeleccionado, setServicioAgendaSeleccionado] = useState(null);
 
 
   const blankForm = {
     cliente:'', telefono:'', direccion:'', articulo:'', fecha:fecha, hora:'',
     ciudad: ciudad === 'Todas' ? 'Barranquilla' : ciudad, origen:'Business',
-    precio:'', observaciones:'', imagen:'', forma_pago:'efectivo'
+    precio:'', observaciones:'', imagen:'', forma_pago:''
   };
   const [formulario, setFormulario] = useState(blankForm);
 
@@ -440,8 +447,20 @@ function App() {
           const publicidadCloud = {};
           const indriverCloud = {};
           const ajustesDiaCompartidoCloud = {};
+          const ajustesPagoDiaCloud = {};
 
           cloudRows.forEach(row => {
+            if (row.tipo === 'ajuste_pago_dia') {
+              const key = String(row.clave || '');
+              if (key) {
+                ajustesPagoDiaCloud[key] = {
+                  pago: Number(row.base || 0),
+                  facturacion: Number(row.producto || 0),
+                  efectivo: Number(row.publicidad || 0)
+                };
+              }
+            }
+
             if (row.tipo === 'ajuste_dia_compartido') {
               const fechaRow = String(row.fecha_inicio || '');
               const trabajadorRow = normalizeWorkerId(row.trabajador_id);
@@ -1145,6 +1164,79 @@ const setAsignados = (id, ids) => {
     );
   };
 
+  const claveAjustePagoDia = (fechaConsulta, trabajadorId) =>
+    `${fechaConsulta}_${normalizeWorkerId(trabajadorId)}`;
+
+  const ajustePagoDia = (fechaConsulta, trabajadorId) =>
+    ajustesPagoDia[claveAjustePagoDia(fechaConsulta, trabajadorId)] || null;
+
+  const facturacionDiaTrabajador = (trabajador, fechaConsulta) => {
+    const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
+    const automatico = serviciosT.reduce((sum, s) => sum + Number(s.precio || 0), 0);
+    const ajuste = ajustePagoDia(fechaConsulta, trabajador?.id);
+    return ajuste?.facturacion !== undefined ? Number(ajuste.facturacion || 0) : automatico;
+  };
+
+  const editarValoresDia = async (trabajador, fechaConsulta) => {
+    const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
+    if (!serviciosT.length) return;
+
+    const actual = ajustePagoDia(fechaConsulta, trabajador.id);
+    const pagoActual = actual?.pago !== undefined
+      ? Number(actual.pago)
+      : Number(pagoTrabajadorDia(trabajador, fechaConsulta) || 0);
+    const facturacionActual = actual?.facturacion !== undefined
+      ? Number(actual.facturacion)
+      : serviciosT.reduce((sum, s) => sum + Number(s.precio || 0), 0);
+    const efectivoAutomatico = cobrosDiarios(trabajador, fechaConsulta).efectivo;
+    const efectivoActual = actual?.efectivo !== undefined
+      ? Number(actual.efectivo)
+      : ((esDaniel(trabajador) || esAngel(trabajador)) && hicieronServicioJuntos(fechaConsulta)
+        ? 0
+        : efectivoAutomatico);
+
+    const pagoTexto = prompt(`Pago FINAL de ${trabajador.nombre} para ${datePagoLabel(fechaConsulta)}:`, String(pagoActual));
+    if (pagoTexto === null) return;
+    const facturacionTexto = prompt(`Facturación de ${trabajador.nombre} para ${datePagoLabel(fechaConsulta)}:`, String(facturacionActual));
+    if (facturacionTexto === null) return;
+    const efectivoTexto = prompt(`Efectivo recibido de ${trabajador.nombre} para ${datePagoLabel(fechaConsulta)}:`, String(efectivoActual));
+    if (efectivoTexto === null) return;
+
+    const pago = Math.max(0, Math.round(Number(String(pagoTexto).replace(/\D/g, '') || 0)));
+    const facturacion = Math.max(0, Math.round(Number(String(facturacionTexto).replace(/\D/g, '') || 0)));
+    const efectivo = Math.max(0, Math.round(Number(String(efectivoTexto).replace(/\D/g, '') || 0)));
+    const key = claveAjustePagoDia(fechaConsulta, trabajador.id);
+    const valores = { pago, facturacion, efectivo };
+    const next = { ...ajustesPagoDia, [key]: valores };
+
+    setAjustesPagoDia(next);
+    persist('tc_ajustes_pago_dia', next);
+
+    const { error } = await supabase
+      .from('finanzas_manuales')
+      .upsert({
+        clave: `ajuste_pago_dia_${key}`,
+        tipo: 'ajuste_pago_dia',
+        trabajador_id: normalizeWorkerId(trabajador.id),
+        periodo_tipo: 'dia',
+        fecha_inicio: fechaConsulta,
+        fecha_fin: fechaConsulta,
+        producto: facturacion,
+        gasolina: 0,
+        base: pago,
+        publicidad: efectivo
+      }, { onConflict: 'clave' });
+
+    if (error) {
+      console.error('TOTAL CLEAN AJUSTE PAGO DIA ERROR:', error);
+      alert(`El ajuste quedó guardado en este dispositivo, pero no se pudo subir a la nube: ${error.message}`);
+      return;
+    }
+
+    setMensaje(`☁️ Valores de ${trabajador.nombre} guardados en la nube`);
+    setTimeout(() => setMensaje(''), 1800);
+  };
+
   const pagoTrabajadorDia = (trabajador, fechaConsulta) => {
     const serviciosT = serviciosDeTrabajadorDia(trabajador, fechaConsulta);
     if (!serviciosT.length) return 0;
@@ -1230,44 +1322,44 @@ Ajustes: $${money(ajustesSemana)}
   };
 
   const cobrosDiarios = (trabajador, fechaConsulta) => {
-    const trabajadorId = normalizeWorkerId(trabajador?.id);
-    const angelId = normalizeWorkerId(SUPABASE_WORKER_IDS.angel);
     const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
+    const ajuste = ajustePagoDia(fechaConsulta, trabajador?.id);
 
-    return serviciosT.reduce(
+    const automaticos = serviciosT.reduce(
       (totales, servicio) => {
         const valor = Number(servicio.precio || 0);
-        const forma = String(servicio.forma_pago || 'efectivo').toLowerCase();
-        const ids = getAsignados(servicio.id).map(normalizeWorkerId);
-        const servicioCompartidoDanielAngel =
-          ids.includes(normalizeWorkerId(SUPABASE_WORKER_IDS.daniel)) &&
-          ids.includes(angelId);
-
+        const forma = String(servicio.forma_pago || '').toLowerCase();
         if (forma === 'transferencia' || forma === 'transferencia bancaria') {
-          // Las transferencias siguen perteneciendo al trabajador asignado.
           totales.transferencia += valor;
-        } else if (!servicioCompartidoDanielAngel || trabajadorId === angelId) {
-          // Si Daniel y Ángel hicieron el servicio juntos, SOLO Ángel recibe
-          // el efectivo de ese servicio. Los demás servicios conservan su dueño.
+        } else if (forma === 'efectivo') {
           totales.efectivo += valor;
         }
-
-        // La facturación/total continúa correspondiendo a los servicios
-        // asignados al trabajador; aquí solo redistribuimos el efectivo.
         totales.total += valor;
         return totales;
       },
       { efectivo: 0, transferencia: 0, total: 0 }
     );
+
+    // Si el usuario editó el efectivo del día, ese valor tiene prioridad.
+    // En días Daniel + Ángel juntos no se asigna efectivo automáticamente:
+    // cada uno queda en $0 hasta que el usuario decida cuánto corresponde.
+    const efectivo = ajuste?.efectivo !== undefined
+      ? Number(ajuste.efectivo || 0)
+      : ((esDaniel(trabajador) || esAngel(trabajador)) && hicieronServicioJuntos(fechaConsulta)
+        ? 0
+        : automaticos.efectivo);
+
+    return {
+      ...automaticos,
+      efectivo,
+      total: Number(ajuste?.facturacion !== undefined ? ajuste.facturacion : automaticos.total)
+    };
   };
 
   const pagoCopiable = (trabajador, fechaConsulta=fecha) => {
     const serviciosT = serviciosContablesDeTrabajadorDia(trabajador, fechaConsulta);
 
-    const facturacion = serviciosT.reduce(
-      (sum, s) => sum + Number(s.precio || 0),
-      0
-    );
+    const facturacion = facturacionDiaTrabajador(trabajador, fechaConsulta);
 
     const moto = motoDelDia(trabajador, fechaConsulta);
     const nombre = String(trabajador.nombre || '').toLowerCase();
@@ -1325,6 +1417,36 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
     setFormOpen(true); setSeccion('agenda');
   };
 
+  // Abre un nuevo servicio desde la ficha de un cliente.
+  // Se reutilizan los datos conocidos del último servicio, pero todos
+  // los campos siguen siendo editables y la nueva cita se guarda aparte.
+  const agendarNuevoServicioCliente = cliente => {
+    const ultimo = cliente?.ultimoServicio || cliente?.servicios?.[0] || {};
+
+    setClienteSeleccionado(null);
+    setEditId(null);
+    setImagenes([]);
+
+    setFormulario({
+      ...blankForm,
+      cliente: cliente?.cliente || '',
+      telefono: cliente?.telefono || '',
+      direccion: ultimo?.direccion || '',
+      ciudad: ultimo?.ciudad || 'Barranquilla',
+      origen: ultimo?.origen || 'Business',
+      fecha,
+      hora: '',
+      articulo: '',
+      precio: '',
+      observaciones: '',
+      imagen: '',
+      forma_pago: ''
+    });
+
+    setFormOpen(true);
+    setSeccion('agenda');
+  };
+
   const editar = servicio => {
     setEditId(servicio.id); setImagenes(leerImagenesServicio(servicio));
     setFormulario({
@@ -1368,7 +1490,7 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
       ciudad:formulario.ciudad, origen:formulario.origen, precio:Number(formulario.precio||0),
       observaciones:formulario.observaciones, imagen:imagenes.length === 1 ? imagenes[0] : (imagenes.length > 1 ? JSON.stringify(imagenes) : null),
       estado: editId ? (servicios.find(s=>s.id===editId)?.estado || 'pendiente') : 'pendiente',
-      forma_pago: formulario.forma_pago || 'efectivo'
+      forma_pago: editId ? (servicios.find(s=>s.id===editId)?.forma_pago || null) : null
     };
     let servicioGuardado = null;
 
@@ -1419,6 +1541,27 @@ ${esMarryJueves ? `*InDriver:* $${money(indriver)}` : `*Moto:* $${money(motoMost
     const {error}=await supabase.from('servicios').update({estado:nuevo}).eq('id',servicio.id);
     if (error) return alert(error.message);
     setServicios(prev=>prev.map(s=>s.id===servicio.id?{...s,estado:nuevo}:s));
+  };
+
+  const cambiarFormaPago = async (servicio, forma) => {
+    if (servicio.estado !== 'realizado') return;
+    if (!['efectivo','transferencia'].includes(forma)) return;
+    if (servicio.forma_pago === forma) return;
+
+    const { data, error } = await supabase
+      .from('servicios')
+      .update({ forma_pago: forma })
+      .eq('id', servicio.id)
+      .select('id,forma_pago')
+      .single();
+
+    if (error) return alert(`No se pudo guardar el método de pago: ${error.message}`);
+
+    setServicios(prev => prev.map(s =>
+      s.id === servicio.id ? { ...s, forma_pago: data?.forma_pago || forma } : s
+    ));
+    setMensaje(`✅ Pago registrado como ${forma === 'efectivo' ? 'efectivo' : 'transferencia'}`);
+    setTimeout(() => setMensaje(''), 1400);
   };
 
   // La sincronización automática en tiempo real se desactiva para reducir Egress.
@@ -1966,12 +2109,56 @@ Ajustes: $${money(ajustesSemana)}
 
   const clientesInicio = useMemo(() => {
     const mapa = new Map();
-    servicios.forEach(s => {
-      const key = `${s.telefono || ''}|${s.cliente || ''}`.toLowerCase();
-      if (!mapa.has(key)) mapa.set(key, s);
+    const normalizarNombre = value => String(value || '')
+      .trim()
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ');
+
+    servicios.forEach(servicio => {
+      const telefono = cleanPhone(servicio.telefono);
+      const nombre = normalizarNombre(servicio.cliente);
+      const key = telefono ? `tel:${telefono}` : `nom:${nombre}`;
+      const actual = mapa.get(key);
+      if (!actual) {
+        mapa.set(key, {
+          cliente: servicio.cliente || 'Sin nombre',
+          telefono: servicio.telefono || '',
+          servicios: [servicio],
+          ultimoServicio: servicio
+        });
+        return;
+      }
+      actual.servicios.push(servicio);
+      const fechaHoraActual = `${actual.ultimoServicio?.fecha || ''} ${actual.ultimoServicio?.hora || ''}`;
+      const fechaHoraNueva = `${servicio.fecha || ''} ${servicio.hora || ''}`;
+      if (fechaHoraNueva > fechaHoraActual) actual.ultimoServicio = servicio;
+      if (!actual.telefono && servicio.telefono) actual.telefono = servicio.telefono;
+      if ((!actual.cliente || actual.cliente === 'Sin nombre') && servicio.cliente) actual.cliente = servicio.cliente;
     });
-    return Array.from(mapa.values());
+
+    return Array.from(mapa.values())
+      .map(cliente => ({
+        ...cliente,
+        servicios: [...cliente.servicios].sort((a,b) => {
+          const aa = `${a.fecha || ''} ${a.hora || ''}`;
+          const bb = `${b.fecha || ''} ${b.hora || ''}`;
+          return bb.localeCompare(aa);
+        })
+      }))
+      .sort((a,b) => `${b.ultimoServicio?.fecha || ''} ${b.ultimoServicio?.hora || ''}`.localeCompare(`${a.ultimoServicio?.fecha || ''} ${a.ultimoServicio?.hora || ''}`));
   }, [servicios]);
+
+  useEffect(() => {
+    if (seccion !== 'agenda' || !servicioAgendaSeleccionado) return;
+    const timer = setTimeout(() => {
+      const elemento = document.querySelector(`[data-service-id="${String(servicioAgendaSeleccionado)}"]`);
+      if (elemento) elemento.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }, 80);
+    const clear = setTimeout(() => setServicioAgendaSeleccionado(null), 2600);
+    return () => { clearTimeout(timer); clearTimeout(clear); };
+  }, [seccion, fecha, servicioAgendaSeleccionado]);
 
   if (authLoading) {
     return (
@@ -2218,11 +2405,19 @@ Ajustes: $${money(ajustesSemana)}
               ? { ...s, imagen: imagenesServicios[String(s.id)] }
               : s;
             const asignados=getAsignados(s.id);
-            return <section className={`tc-service ${s.estado==='realizado'?'done':''}`} key={s.id}>
+            return <section data-service-id={String(s.id)} className={`tc-service ${s.estado==='realizado'?'done':''} ${servicioAgendaSeleccionado===s.id?'tc-service-highlight':''}`} key={s.id}>
               <div className="tc-service-top"><strong>⏰ {horaCorta(s.hora)}</strong><span>{CIUDADES[s.ciudad]?.icono} {s.ciudad}</span><span>{s.estado==='realizado'?'🟢 REALIZADO':'🟡 PENDIENTE'}</span></div>
               <h3>{s.cliente}</h3>
               <p>📞 {s.telefono}</p><p>📍 {s.direccion}</p><p>🛋️ {s.articulo}</p><p>💰 <strong>${money(s.precio)}</strong></p>
-              <p>💳 {s.forma_pago==='transferencia'?'Transferencia':'Efectivo'} {s.forma_pago==='efectivo'&&<span className="tc-badge">Efectivo pendiente</span>}</p>
+              {s.estado==='realizado' ? (
+                <div className="tc-payment-methods">
+                  <span>💳 Método de pago</span>
+                  <button type="button" className={s.forma_pago==='efectivo'?'active cash':''} onClick={()=>cambiarFormaPago(s,'efectivo')}>💵 Efectivo</button>
+                  <button type="button" className={s.forma_pago==='transferencia'?'active transfer':''} onClick={()=>cambiarFormaPago(s,'transferencia')}>🏦 Transferencia</button>
+                </div>
+              ) : (
+                <p>💳 Método de pago: <strong>Se registra al realizar el servicio</strong></p>
+              )}
               {leerImagenesServicio(servicioConImagen).length > 0 && (
                 <div className="tc-service-images">
                   <div className="tc-service-images-grid">
@@ -2272,21 +2467,86 @@ Ajustes: $${money(ajustesSemana)}
           <section className="tc-client-list">
             {clientesInicio
               .filter(c=>{
-                const q=busqueda.toLowerCase();
+                const q=busqueda.toLowerCase().trim();
                 return !q || String(c.cliente||'').toLowerCase().includes(q) || String(c.telefono||'').includes(q);
               })
               .map(c=>(
-                <article className="tc-client-card" key={`${c.telefono}|${c.cliente}`}>
+                <button
+                  type="button"
+                  className="tc-client-card"
+                  key={c.telefono ? `tel:${cleanPhone(c.telefono)}` : `nom:${String(c.cliente).toLowerCase()}`}
+                  onClick={()=>setClienteSeleccionado(c)}
+                >
                   <div className="tc-client-avatar">{String(c.cliente||'?').trim().charAt(0).toUpperCase()}</div>
                   <div>
                     <strong>{c.cliente}</strong>
                     <span>📞 {c.telefono || 'Sin teléfono'}</span>
-                    <small>Último servicio: {dateLabel(c.fecha)}</small>
+                    <small>Último servicio: {c.ultimoServicio ? dateLabel(c.ultimoServicio.fecha) : 'Sin servicios'}</small>
+                    <small>{c.servicios.length} servicio{c.servicios.length===1?'':'s'} registrado{c.servicios.length===1?'':'s'}</small>
                   </div>
                   <Icon name="chevron" size={19}/>
-                </article>
+                </button>
               ))}
           </section>
+
+          {clienteSeleccionado && (
+            <div className="tc-modal" onMouseDown={e=>{if(e.target===e.currentTarget)setClienteSeleccionado(null)}}>
+              <div className="tc-modal-box tc-client-history-modal">
+                <div className="tc-client-history-head">
+                  <div>
+                    <h2>👤 {clienteSeleccionado.cliente}</h2>
+                    <p>📞 {clienteSeleccionado.telefono || 'Sin teléfono'}</p>
+                  </div>
+                  <button type="button" className="tc-close-button" onClick={()=>setClienteSeleccionado(null)}>✕</button>
+                </div>
+
+                {clienteSeleccionado.ultimoServicio && (
+                  <div className="tc-client-last-service">
+                    <span>Último servicio</span>
+                    <strong>{dateLabel(clienteSeleccionado.ultimoServicio.fecha)}</strong>
+                    <small>{horaCorta(clienteSeleccionado.ultimoServicio.hora)} · {clienteSeleccionado.ultimoServicio.articulo || 'Servicio de limpieza'} · ${money(clienteSeleccionado.ultimoServicio.precio)}</small>
+                  </div>
+                )}
+
+                <h3>📋 Historial de servicios</h3>
+                <div className="tc-client-history-list">
+                  {clienteSeleccionado.servicios.map(servicio => (
+                    <button
+                      type="button"
+                      className="tc-client-history-row"
+                      key={servicio.id}
+                      onClick={()=>{
+                        setFecha(servicio.fecha);
+                        setCiudad('Todas');
+                        setBusqueda('');
+                        setServicioAgendaSeleccionado(servicio.id);
+                        setClienteSeleccionado(null);
+                        setSeccion('agenda');
+                      }}
+                    >
+                      <div>
+                        <strong>{dateLabel(servicio.fecha)}</strong>
+                        <span>{horaCorta(servicio.hora)} · {servicio.articulo || 'Servicio de limpieza'}</span>
+                      </div>
+                      <div>
+                        <strong>${money(servicio.precio)}</strong>
+                        <small>{servicio.estado==='realizado'?'✅ Realizado':'🟡 Pendiente'}</small>
+                      </div>
+                      <Icon name="chevron" size={18}/>
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  className="tc-client-new-service-button"
+                  onClick={()=>agendarNuevoServicioCliente(clienteSeleccionado)}
+                >
+                  <Icon name="plus" size={18}/>
+                  <span>Agendar nuevo servicio</span>
+                </button>
+              </div>
+            </div>
+          )}
         </main>
       )}
 
@@ -2319,13 +2579,14 @@ Ajustes: $${money(ajustesSemana)}
 
               {trabajadores.map(t=>{
                 const serviciosDia=serviciosDeTrabajadorDia(t,fechaTrabajadores);
-                const total=pagoTrabajadorDia(t,fechaTrabajadores);
+                const ajustePagoDiaActual=ajustePagoDia(fechaTrabajadores,t.id);
+                const total=ajustePagoDiaActual?.pago !== undefined ? Number(ajustePagoDiaActual.pago) : pagoTrabajadorDia(t,fechaTrabajadores);
                 const moto=motoDelDia(t,fechaTrabajadores);
                 const ajusteCompartido=ajusteDiaCompartido(fechaTrabajadores,t.id);
                 const motoMostrada=(esDaniel(t) || esAngel(t)) && hicieronServicioJuntos(fechaTrabajadores) && ajusteCompartido?.moto !== undefined
                   ? Number(ajusteCompartido.moto)
                   : moto;
-                const generado=serviciosDia.reduce((sum,s)=>sum+Number(s.precio||0),0);
+                const generado=facturacionDiaTrabajador(t,fechaTrabajadores);
 
                 if (!serviciosDia.length) return null;
 
@@ -2337,15 +2598,13 @@ Ajustes: $${money(ajustesSemana)}
                     {String(t.nombre).toLowerCase()==='daniel' && (
                       <small>Ajuste Daniel: -$10.000</small>
                     )}
-                    {(esDaniel(t) || esAngel(t)) && hicieronServicioJuntos(fechaTrabajadores) && (
-                      <button
-                        type="button"
-                        className="tc-shared-adjust"
-                        onClick={()=>editarPagoDiaCompartido(t,fechaTrabajadores)}
-                      >
-                        ✏️ Ajustar pago y moto
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      className="tc-edit-day-button"
+                      onClick={()=>editarValoresDia(t,fechaTrabajadores)}
+                    >
+                      ✏️ Editar valores
+                    </button>
                   </div>
 
                   <div className="tc-worker-money">${money(total)}</div>
@@ -2884,7 +3143,7 @@ const descuentoProductoTrabajador =
           <input value={formulario.direccion} onChange={e=>setFormulario({...formulario,direccion:e.target.value})} placeholder="Dirección" required/>
           <input value={formulario.articulo} onChange={e=>setFormulario({...formulario,articulo:e.target.value})} placeholder="Artículo / Servicio" required/>
           <div className="tc-two"><input type="date" value={formulario.fecha} onChange={e=>setFormulario({...formulario,fecha:e.target.value})} required/><input type="time" value={formulario.hora} onChange={e=>setFormulario({...formulario,hora:e.target.value})} required/></div>
-          <div className="tc-two"><select value={formulario.ciudad} onChange={e=>setFormulario({...formulario,ciudad:e.target.value})}><option>Barranquilla</option><option>Cartagena</option><option>Santa Marta</option></select><select value={formulario.forma_pago} onChange={e=>setFormulario({...formulario,forma_pago:e.target.value})}><option value="efectivo">💵 Efectivo</option><option value="transferencia">🏦 Transferencia</option></select></div>
+          <div className="tc-two"><select value={formulario.ciudad} onChange={e=>setFormulario({...formulario,ciudad:e.target.value})}><option>Barranquilla</option><option>Cartagena</option><option>Santa Marta</option></select><div className="tc-form-note">💳 El método de pago se registra cuando el servicio esté realizado.</div></div>
           <select value={formulario.origen} onChange={e=>setFormulario({...formulario,origen:e.target.value})}>{ORIGENES.map(o=><option value={o.nombre} key={o.nombre}>{o.icono} {o.nombre}</option>)}</select>
           <input inputMode="numeric" value={money(formulario.precio)} onChange={e=>setFormulario({...formulario,precio:e.target.value.replace(/\D/g,'')})} placeholder="Precio" required/>
           <textarea value={formulario.observaciones} onChange={e=>setFormulario({...formulario,observaciones:e.target.value})} placeholder="Observaciones"/>
